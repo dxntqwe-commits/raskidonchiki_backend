@@ -3,3 +3,4 @@ uvicorn>=0.30.0
 pydantic>=2.9.0
 python-multipart>=0.0.9
 aiofiles>=24.1.0
+aiogram>=3.13.0
