@@ -1,48 +1,49 @@
 import json
 import os
+import logging
+import uuid
 from pathlib import Path
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Header
+
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import uuid
 
-app = FastAPI(title="Raskidonchiki API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    WebAppInfo, MenuButtonWebApp, Update,
 )
+from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.client.default import DefaultBotProperties
 
-DATA_FILE = Path(__file__).parent / "markers.json"
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Admin IDs (same as bot)
+# ========== CONFIG ==========
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8893552048:AAHdsPXbFtPPMRalW8oaa-DjLyRwirL_n_Q")
+CHANNEL_USERNAME = "raskidonchiki"
+CHANNEL_ID = -1002417376378
 ADMIN_IDS = {661340242, 281387611}
+MINI_APP_URL = os.getenv("MINI_APP_URL", "https://phenomenal-douhua-f7bcf1.netlify.app")
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://raskidonchiki-api.onrender.com")
 
+# ========== DATA ==========
+DATA_FILE = Path(__file__).parent / "markers.json"
 MAPS = ["mirage", "dust2", "inferno", "nuke", "ancient", "anubis", "cache"]
-GRENADE_TYPES = [
-    "smoke",
-    "flash",
-    "molotov",
-    "he",
-    "insta_smoke_ct",
-    "insta_smoke_t",
-]
-
+GRENADE_TYPES = ["smoke", "flash", "molotov", "he", "insta_smoke_ct", "insta_smoke_t"]
 
 class Marker(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     map: str
     grenade_type: str
-    x: float  # percentage 0-100
-    y: float  # percentage 0-100
+    x: float
+    y: float
     title: str = ""
-    link: str  # Telegram post link
-    side: Optional[str] = None  # T / CT / both
-
+    link: str
+    side: Optional[str] = None
 
 class MarkerCreate(BaseModel):
     map: str
@@ -53,28 +54,164 @@ class MarkerCreate(BaseModel):
     link: str
     side: Optional[str] = None
 
-
 def load_markers() -> List[dict]:
     if not DATA_FILE.exists():
         return []
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
 def save_markers(markers: List[dict]):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(markers, f, ensure_ascii=False, indent=2)
 
+# ========== BOT ==========
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+
+async def is_subscribed(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        return member.status in (
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.CREATOR,
+        )
+    except Exception as e:
+        logger.error(f"Sub check error: {e}")
+        return False
+
+def get_subscribe_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Підписатися на канал", url=f"https://t.me/{CHANNEL_USERNAME}")],
+        [InlineKeyboardButton(text="✅ Я підписався — перевірити", callback_data="check_sub")],
+    ])
+
+def get_main_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text="🗺️ Відкрити розкидки", web_app=WebAppInfo(url=MINI_APP_URL))],
+        [InlineKeyboardButton(text="💡 Запропонувати смоук", callback_data="propose_smoke")],
+    ]
+    if is_admin:
+        buttons.append([InlineKeyboardButton(
+            text="⚙️ Адмін-панель",
+            web_app=WebAppInfo(url=f"{MINI_APP_URL}?admin=1")
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    user_id = message.from_user.id
+    is_admin = user_id in ADMIN_IDS
+    if await is_subscribed(user_id):
+        await message.answer(
+            "🔥 <b>Вітаю в Raskidonchiki Lineups!</b>\n\n"
+            "Тут ти знайдеш усі корисні розкидки смоків, флешок та інших гранат.\n\n"
+            "Натискай кнопку нижче, щоб відкрити карти:",
+            reply_markup=get_main_keyboard(is_admin),
+        )
+    else:
+        await message.answer(
+            "👋 Привіт!\n\n"
+            f"Щоб користуватися ботом — підпишись на канал <b>@{CHANNEL_USERNAME}</b>.\n\n"
+            "Після підписки натисни «Я підписався».",
+            reply_markup=get_subscribe_keyboard(),
+        )
+
+@dp.callback_query(F.data == "check_sub")
+async def check_subscription(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    is_admin = user_id in ADMIN_IDS
+    if await is_subscribed(user_id):
+        await callback.message.edit_text(
+            "🔥 <b>Дякуємо за підписку!</b>\n\nТепер ти можеш користуватися всіма розкидками.",
+            reply_markup=get_main_keyboard(is_admin),
+        )
+    else:
+        await callback.answer("❌ Ти ще не підписаний. Підпишись і спробуй знову.", show_alert=True)
+
+@dp.callback_query(F.data == "propose_smoke")
+async def propose_smoke(callback: CallbackQuery):
+    await callback.message.answer(
+        "💡 <b>Запропонувати смоук</b>\n\n"
+        "Напиши в одному повідомленні:\n"
+        "• Карта\n• Тип гранати\n• Короткий опис\n• Посилання (якщо є)\n\n"
+        "Просто надішли наступним повідомленням."
+    )
+    await callback.answer()
+
+@dp.message(F.text & ~F.text.startswith("/"))
+async def handle_proposal(message: Message):
+    if message.from_user.id in ADMIN_IDS:
+        return
+    text = (
+        f"💡 <b>Нова пропозиція смоука</b>\n\n"
+        f"Від: @{message.from_user.username or 'без_username'} "
+        f"(ID: <code>{message.from_user.id}</code>)\n\n"
+        f"{message.text}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception as e:
+            logger.error(f"Failed to send to {admin_id}: {e}")
+    await message.answer("✅ Дякуємо! Твою пропозицію надіслано адмінам.")
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await message.answer(
+        "⚙️ <b>Адмін-панель</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="⚙️ Відкрити адмін-панель",
+                web_app=WebAppInfo(url=f"{MINI_APP_URL}?admin=1"),
+            )
+        ]]),
+    )
+
+# ========== FASTAPI ==========
+app = FastAPI(title="Raskidonchiki API + Bot")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def on_startup():
+    webhook_url = RENDER_EXTERNAL_URL.rstrip("/") + WEBHOOK_PATH
+    try:
+        await bot.set_webhook(webhook_url, drop_pending_updates=True)
+        logger.info(f"Webhook set: {webhook_url}")
+        await bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(text="🗺️ Розкидки", web_app=WebAppInfo(url=MINI_APP_URL))
+        )
+        logger.info("Menu button set")
+    except Exception as e:
+        logger.error(f"Startup error: {e}")
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await bot.session.close()
+
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    update = Update.model_validate(data, context={"bot": bot})
+    await dp.feed_update(bot, update)
+    return {"ok": True}
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
-
+    return {"status": "ok", "mini_app": MINI_APP_URL}
 
 @app.get("/api/maps")
 async def get_maps():
     return {"maps": MAPS, "grenade_types": GRENADE_TYPES}
-
 
 @app.get("/api/markers")
 async def get_markers(map: Optional[str] = None, grenade_type: Optional[str] = None):
@@ -85,29 +222,24 @@ async def get_markers(map: Optional[str] = None, grenade_type: Optional[str] = N
         markers = [m for m in markers if m["grenade_type"] == grenade_type]
     return {"markers": markers}
 
-
 @app.post("/api/markers")
 async def create_marker(marker: MarkerCreate, x_telegram_user_id: Optional[int] = Header(None)):
     if x_telegram_user_id not in ADMIN_IDS:
         raise HTTPException(status_code=403, detail="Admin access required")
-
     if marker.map not in MAPS:
         raise HTTPException(status_code=400, detail="Invalid map")
     if marker.grenade_type not in GRENADE_TYPES:
         raise HTTPException(status_code=400, detail="Invalid grenade type")
-
     markers = load_markers()
     new_marker = Marker(**marker.model_dump()).model_dump()
     markers.append(new_marker)
     save_markers(markers)
     return {"marker": new_marker}
 
-
 @app.delete("/api/markers/{marker_id}")
 async def delete_marker(marker_id: str, x_telegram_user_id: Optional[int] = Header(None)):
     if x_telegram_user_id not in ADMIN_IDS:
         raise HTTPException(status_code=403, detail="Admin access required")
-
     markers = load_markers()
     new_markers = [m for m in markers if m["id"] != marker_id]
     if len(new_markers) == len(markers):
@@ -115,12 +247,10 @@ async def delete_marker(marker_id: str, x_telegram_user_id: Optional[int] = Head
     save_markers(new_markers)
     return {"ok": True}
 
-
 @app.put("/api/markers/{marker_id}")
 async def update_marker(marker_id: str, marker: MarkerCreate, x_telegram_user_id: Optional[int] = Header(None)):
     if x_telegram_user_id not in ADMIN_IDS:
         raise HTTPException(status_code=403, detail="Admin access required")
-
     markers = load_markers()
     for i, m in enumerate(markers):
         if m["id"] == marker_id:
@@ -129,8 +259,3 @@ async def update_marker(marker_id: str, marker: MarkerCreate, x_telegram_user_id
             save_markers(markers)
             return {"marker": updated}
     raise HTTPException(status_code=404, detail="Marker not found")
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
