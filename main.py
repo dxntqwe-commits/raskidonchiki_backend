@@ -2,9 +2,9 @@ import json
 import os
 import logging
 import uuid
-from pathlib import Path
 from typing import List, Optional
 
+import aiohttp
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -30,20 +30,11 @@ MINI_APP_URL = os.getenv("MINI_APP_URL", "https://phenomenal-douhua-f7bcf1.netli
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://raskidonchiki-api.onrender.com")
 
-# ========== DATA ==========
-DATA_FILE = Path(__file__).parent / "markers.json"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://xlqdomjssggkapovljpo.supabase.co").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+
 MAPS = ["mirage", "dust2", "inferno", "nuke", "ancient", "anubis", "cache"]
 GRENADE_TYPES = ["smoke", "flash", "molotov", "he", "insta_smoke_ct", "insta_smoke_t"]
-
-class Marker(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    map: str
-    grenade_type: str
-    x: float
-    y: float
-    title: str = ""
-    link: str
-    side: Optional[str] = None
 
 class MarkerCreate(BaseModel):
     map: str
@@ -53,16 +44,58 @@ class MarkerCreate(BaseModel):
     title: str = ""
     link: str
     side: Optional[str] = None
+    from_x: Optional[float] = None
+    from_y: Optional[float] = None
 
-def load_markers() -> List[dict]:
-    if not DATA_FILE.exists():
+# ========== SUPABASE HELPERS ==========
+def _headers(extra=None):
+    h = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if extra:
+        h.update(extra)
+    return h
+
+async def sb_get_markers(map_name: Optional[str] = None, grenade_type: Optional[str] = None) -> List[dict]:
+    if not SUPABASE_KEY:
         return []
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    params = []
+    if map_name:
+        params.append(f"map=eq.{map_name}")
+    if grenade_type:
+        params.append(f"grenade_type=eq.{grenade_type}")
+    q = ("&".join(params)) if params else ""
+    url = f"{SUPABASE_URL}/rest/v1/markers?select=*{'&' + q if q else ''}"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=_headers()) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                logger.error(f"Supabase GET error {resp.status}: {text}")
+                return []
+            return await resp.json()
 
-def save_markers(markers: List[dict]):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(markers, f, ensure_ascii=False, indent=2)
+async def sb_insert_marker(data: dict) -> dict:
+    url = f"{SUPABASE_URL}/rest/v1/markers"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            url,
+            headers=_headers({"Prefer": "return=representation"}),
+            json=data,
+        ) as resp:
+            text = await resp.text()
+            if resp.status not in (200, 201):
+                logger.error(f"Supabase INSERT error {resp.status}: {text}")
+                raise HTTPException(status_code=500, detail=f"DB error: {text}")
+            rows = json.loads(text) if text else []
+            return rows[0] if isinstance(rows, list) and rows else data
+
+async def sb_delete_marker(marker_id: str) -> bool:
+    url = f"{SUPABASE_URL}/rest/v1/markers?id=eq.{marker_id}"
+    async with aiohttp.ClientSession() as session:
+        async with session.delete(url, headers=_headers()) as resp:
+            return resp.status in (200, 204)
 
 # ========== BOT ==========
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -94,7 +127,7 @@ def get_main_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
     if is_admin:
         buttons.append([InlineKeyboardButton(
             text="⚙️ Адмін-панель",
-            web_app=WebAppInfo(url=f"{MINI_APP_URL}?admin=1")
+            web_app=WebAppInfo(url=f"{MINI_APP_URL}?admin=1"),
         )])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -105,15 +138,13 @@ async def cmd_start(message: Message):
     if await is_subscribed(user_id):
         await message.answer(
             "🔥 <b>Вітаю в Raskidonchiki Lineups!</b>\n\n"
-            "Тут ти знайдеш усі корисні розкидки смоків, флешок та інших гранат.\n\n"
             "Натискай кнопку нижче, щоб відкрити карти:",
             reply_markup=get_main_keyboard(is_admin),
         )
     else:
         await message.answer(
             "👋 Привіт!\n\n"
-            f"Щоб користуватися ботом — підпишись на канал <b>@{CHANNEL_USERNAME}</b>.\n\n"
-            "Після підписки натисни «Я підписався».",
+            f"Підпишись на канал <b>@{CHANNEL_USERNAME}</b>, потім натисни «Я підписався».",
             reply_markup=get_subscribe_keyboard(),
         )
 
@@ -123,19 +154,17 @@ async def check_subscription(callback: CallbackQuery):
     is_admin = user_id in ADMIN_IDS
     if await is_subscribed(user_id):
         await callback.message.edit_text(
-            "🔥 <b>Дякуємо за підписку!</b>\n\nТепер ти можеш користуватися всіма розкидками.",
+            "🔥 <b>Дякуємо за підписку!</b>",
             reply_markup=get_main_keyboard(is_admin),
         )
     else:
-        await callback.answer("❌ Ти ще не підписаний. Підпишись і спробуй знову.", show_alert=True)
+        await callback.answer("❌ Ти ще не підписаний.", show_alert=True)
 
 @dp.callback_query(F.data == "propose_smoke")
 async def propose_smoke(callback: CallbackQuery):
     await callback.message.answer(
         "💡 <b>Запропонувати смоук</b>\n\n"
-        "Напиши в одному повідомленні:\n"
-        "• Карта\n• Тип гранати\n• Короткий опис\n• Посилання (якщо є)\n\n"
-        "Просто надішли наступним повідомленням."
+        "Напиши: карта, тип гранати, опис, посилання."
     )
     await callback.answer()
 
@@ -144,27 +173,26 @@ async def handle_proposal(message: Message):
     if message.from_user.id in ADMIN_IDS:
         return
     text = (
-        f"💡 <b>Нова пропозиція смоука</b>\n\n"
-        f"Від: @{message.from_user.username or 'без_username'} "
-        f"(ID: <code>{message.from_user.id}</code>)\n\n"
-        f"{message.text}"
+        f"💡 <b>Нова пропозиція</b>\n\n"
+        f"Від: @{message.from_user.username or 'no_username'} "
+        f"(<code>{message.from_user.id}</code>)\n\n{message.text}"
     )
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(admin_id, text)
         except Exception as e:
-            logger.error(f"Failed to send to {admin_id}: {e}")
-    await message.answer("✅ Дякуємо! Твою пропозицію надіслано адмінам.")
+            logger.error(e)
+    await message.answer("✅ Надіслано адмінам.")
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
     await message.answer(
-        "⚙️ <b>Адмін-панель</b>",
+        "⚙️ Адмін-панель",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
-                text="⚙️ Відкрити адмін-панель",
+                text="⚙️ Відкрити",
                 web_app=WebAppInfo(url=f"{MINI_APP_URL}?admin=1"),
             )
         ]]),
@@ -172,7 +200,6 @@ async def cmd_admin(message: Message):
 
 # ========== FASTAPI ==========
 app = FastAPI(title="Raskidonchiki API + Bot")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -183,6 +210,8 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def on_startup():
+    if not SUPABASE_KEY:
+        logger.warning("SUPABASE_KEY is empty — markers will not persist!")
     webhook_url = RENDER_EXTERNAL_URL.rstrip("/") + WEBHOOK_PATH
     try:
         await bot.set_webhook(webhook_url, drop_pending_updates=True)
@@ -190,7 +219,6 @@ async def on_startup():
         await bot.set_chat_menu_button(
             menu_button=MenuButtonWebApp(text="🗺️ Розкидки", web_app=WebAppInfo(url=MINI_APP_URL))
         )
-        logger.info("Menu button set")
     except Exception as e:
         logger.error(f"Startup error: {e}")
 
@@ -207,7 +235,11 @@ async def telegram_webhook(request: Request):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "mini_app": MINI_APP_URL}
+    return {
+        "status": "ok",
+        "mini_app": MINI_APP_URL,
+        "supabase": bool(SUPABASE_KEY),
+    }
 
 @app.get("/api/maps")
 async def get_maps():
@@ -215,11 +247,7 @@ async def get_maps():
 
 @app.get("/api/markers")
 async def get_markers(map: Optional[str] = None, grenade_type: Optional[str] = None):
-    markers = load_markers()
-    if map:
-        markers = [m for m in markers if m["map"] == map]
-    if grenade_type:
-        markers = [m for m in markers if m["grenade_type"] == grenade_type]
+    markers = await sb_get_markers(map, grenade_type)
     return {"markers": markers}
 
 @app.post("/api/markers")
@@ -230,32 +258,26 @@ async def create_marker(marker: MarkerCreate, x_telegram_user_id: Optional[int] 
         raise HTTPException(status_code=400, detail="Invalid map")
     if marker.grenade_type not in GRENADE_TYPES:
         raise HTTPException(status_code=400, detail="Invalid grenade type")
-    markers = load_markers()
-    new_marker = Marker(**marker.model_dump()).model_dump()
-    markers.append(new_marker)
-    save_markers(markers)
-    return {"marker": new_marker}
+    data = {
+        "id": str(uuid.uuid4()),
+        "map": marker.map,
+        "grenade_type": marker.grenade_type,
+        "x": marker.x,
+        "y": marker.y,
+        "title": marker.title or marker.grenade_type,
+        "link": marker.link,
+        "side": marker.side,
+        "from_x": marker.from_x,
+        "from_y": marker.from_y,
+    }
+    saved = await sb_insert_marker(data)
+    return {"marker": saved}
 
 @app.delete("/api/markers/{marker_id}")
 async def delete_marker(marker_id: str, x_telegram_user_id: Optional[int] = Header(None)):
     if x_telegram_user_id not in ADMIN_IDS:
         raise HTTPException(status_code=403, detail="Admin access required")
-    markers = load_markers()
-    new_markers = [m for m in markers if m["id"] != marker_id]
-    if len(new_markers) == len(markers):
+    ok = await sb_delete_marker(marker_id)
+    if not ok:
         raise HTTPException(status_code=404, detail="Marker not found")
-    save_markers(new_markers)
     return {"ok": True}
-
-@app.put("/api/markers/{marker_id}")
-async def update_marker(marker_id: str, marker: MarkerCreate, x_telegram_user_id: Optional[int] = Header(None)):
-    if x_telegram_user_id not in ADMIN_IDS:
-        raise HTTPException(status_code=403, detail="Admin access required")
-    markers = load_markers()
-    for i, m in enumerate(markers):
-        if m["id"] == marker_id:
-            updated = Marker(id=marker_id, **marker.model_dump()).model_dump()
-            markers[i] = updated
-            save_markers(markers)
-            return {"marker": updated}
-    raise HTTPException(status_code=404, detail="Marker not found")
